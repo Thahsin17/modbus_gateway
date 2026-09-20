@@ -1,0 +1,54 @@
+1.3 Major Tasks
+TASK TCPServerTask(arg):
+    socket = TCP_Listen(port = 502)
+    LOOP FOREVER:
+        client = TCP_Accept(socket)                  // blocks task, not CPU
+        LOOP WHILE client connected:
+            mbap = TCP_Receive(client, 7 bytes)       // MBAP header
+            IF invalid: CLOSE client; BREAK
+            pdu  = TCP_Receive(client, mbap.Length - 1 bytes)
+
+            request = {transactionId: mbap.TransactionId,
+                       unitId: mbap.UnitId, pdu: pdu}
+            QueueSend(xReqQueue, request, WAIT_FOREVER)
+
+            response = QueueReceive(xRespQueue, WAIT_FOREVER)  // BLOCKS here
+
+            reply = BuildMBAP(mbap.TransactionId) + response.pdu
+            TCP_Send(client, reply)
+END TASK
+
+TASK RTUMasterTask(arg):
+    LOOP FOREVER:
+        request = QueueReceive(xReqQueue, WAIT_FOREVER)   // sleeps, 0% CPU
+
+        frame = request.unitId + request.pdu
+        frame += CRC16(frame)
+
+        GPIO_Set(RS485_DE)             // enable RS-485 driver
+        UART_Transmit(frame)
+        GPIO_Clear(RS485_DE)           // switch to listen mode
+
+        gotReply = SemaphoreTake(xRtuRxSemaphore, timeout = 500 ms)
+
+        MutexLock(xStatsMutex)
+        IF gotReply AND CRC16(received) valid:
+            response.status = OK
+            stats.successCount++
+        ELSE IF NOT gotReply:
+            response.status = GATEWAY_TARGET_NO_RESPONSE
+            stats.timeoutCount++
+        ELSE:
+            response.status = GATEWAY_TARGET_NO_RESPONSE
+            stats.crcErrorCount++
+        MutexUnlock(xStatsMutex)
+
+        QueueSend(xRespQueue, response, WAIT_FOREVER)
+END TASK
+
+TASK WatchdogTask(arg):
+    LOOP FOREVER:
+        IWDG_Refresh()
+        GPIO_Toggle(HeartbeatLED)
+        TaskDelay(1000 ms)              // yields CPU; does not busy-wait
+END TASK
