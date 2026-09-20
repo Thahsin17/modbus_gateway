@@ -1,0 +1,9 @@
+1.2 Task Creation
+FUNCTION Task_Creation():
+    TaskCreate(TCPServerTask, "TCPServer", stack=1024 words, priority=3, arg=NULL)
+    TaskCreate(RTUMasterTask, "RTUMaster", stack=512 words,  priority=3, arg=NULL)
+    TaskCreate(WatchdogTask,  "Watchdog",  stack=256 words,  priority=1, arg=NULL)
+    // Equal priority (3) for TCP/RTU tasks: the transaction is only as fast
+    // as its slowest half, so neither is more urgent than the other.
+    // Watchdog is low priority (1): it must never delay real Modbus traffic.
+END FUNCTION
