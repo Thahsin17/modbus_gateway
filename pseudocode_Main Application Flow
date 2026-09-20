@@ -1,0 +1,15 @@
+1.6 Main Application Flow
+POWER ON
+  -> HAL/Peripheral/RTOS-object init (1.1)
+  -> Create tasks (1.2), all initially BLOCKED on their queue/semaphore
+  -> Start scheduler
+      -> TCPServerTask blocks on TCP_Accept / xRespQueue
+      -> RTUMasterTask blocks on xReqQueue
+      -> WatchdogTask sleeps 1000 ms at a time
+  -> EVENT: TCP client sends a request
+      -> TCPServerTask wakes -> pushes to xReqQueue -> blocks on xRespQueue
+      -> RTUMasterTask wakes -> sends RTU frame -> blocks on semaphore
+      -> EVENT: UART RX ISR fires -> gives semaphore
+      -> RTUMasterTask wakes -> pushes result to xRespQueue -> blocks again
+      -> TCPServerTask wakes -> replies to client -> loops back
+  -> System runs forever, each task idle (0% CPU) except when its event occurs
