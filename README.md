@@ -1,1 +1,414 @@
 # modbus_gateway
+1. Pseudocode
+1.1 Initialization
+FUNCTION main():
+    HAL_Init()
+    SystemClock_Config()
+    MX_GPIO_Init()              // configures RS485_DE pin as output
+    MX_USART2_UART_Init()       // RS-485 UART (RTU side)
+    MX_LWIP_Init()              // Ethernet + TCP/IP stack (TCP side)
+    MX_IWDG_Init()              // independent watchdog (optional but recommended)
+
+    // RTOS objects must exist BEFORE the scheduler starts
+    xReqQueue        = QueueCreate(length = 4, itemSize = sizeof(ModbusRequest_t))
+    xRespQueue       = QueueCreate(length = 4, itemSize = sizeof(ModbusResponse_t))
+    xRtuRxSemaphore  = SemaphoreCreateBinary()
+    xStatsMutex      = MutexCreate()
+
+    CALL Task_Creation()
+    SchedulerStart()            // control never returns from here
+END FUNCTION
+1.2 Task Creation
+FUNCTION Task_Creation():
+    TaskCreate(TCPServerTask, "TCPServer", stack=1024 words, priority=3, arg=NULL)
+    TaskCreate(RTUMasterTask, "RTUMaster", stack=512 words,  priority=3, arg=NULL)
+    TaskCreate(WatchdogTask,  "Watchdog",  stack=256 words,  priority=1, arg=NULL)
+    // Equal priority (3) for TCP/RTU tasks: the transaction is only as fast
+    // as its slowest half, so neither is more urgent than the other.
+    // Watchdog is low priority (1): it must never delay real Modbus traffic.
+END FUNCTION
+1.3 Major Tasks
+TASK TCPServerTask(arg):
+    socket = TCP_Listen(port = 502)
+    LOOP FOREVER:
+        client = TCP_Accept(socket)                  // blocks task, not CPU
+        LOOP WHILE client connected:
+            mbap = TCP_Receive(client, 7 bytes)       // MBAP header
+            IF invalid: CLOSE client; BREAK
+            pdu  = TCP_Receive(client, mbap.Length - 1 bytes)
+
+            request = {transactionId: mbap.TransactionId,
+                       unitId: mbap.UnitId, pdu: pdu}
+            QueueSend(xReqQueue, request, WAIT_FOREVER)
+
+            response = QueueReceive(xRespQueue, WAIT_FOREVER)  // BLOCKS here
+
+            reply = BuildMBAP(mbap.TransactionId) + response.pdu
+            TCP_Send(client, reply)
+END TASK
+
+TASK RTUMasterTask(arg):
+    LOOP FOREVER:
+        request = QueueReceive(xReqQueue, WAIT_FOREVER)   // sleeps, 0% CPU
+
+        frame = request.unitId + request.pdu
+        frame += CRC16(frame)
+
+        GPIO_Set(RS485_DE)             // enable RS-485 driver
+        UART_Transmit(frame)
+        GPIO_Clear(RS485_DE)           // switch to listen mode
+
+        gotReply = SemaphoreTake(xRtuRxSemaphore, timeout = 500 ms)
+
+        MutexLock(xStatsMutex)
+        IF gotReply AND CRC16(received) valid:
+            response.status = OK
+            stats.successCount++
+        ELSE IF NOT gotReply:
+            response.status = GATEWAY_TARGET_NO_RESPONSE
+            stats.timeoutCount++
+        ELSE:
+            response.status = GATEWAY_TARGET_NO_RESPONSE
+            stats.crcErrorCount++
+        MutexUnlock(xStatsMutex)
+
+        QueueSend(xRespQueue, response, WAIT_FOREVER)
+END TASK
+
+TASK WatchdogTask(arg):
+    LOOP FOREVER:
+        IWDG_Refresh()
+        GPIO_Toggle(HeartbeatLED)
+        TaskDelay(1000 ms)              // yields CPU; does not busy-wait
+END TASK
+1.4 Synchronization
+// (a) ISR -> Task handoff: binary semaphore
+ISR UART_RxCompleteCallback():
+    higherPriorityTaskWoken = FALSE
+    SemaphoreGiveFromISR(xRtuRxSemaphore, &higherPriorityTaskWoken)
+    YieldFromISR(higherPriorityTaskWoken)
+    // ISR only "gives" -- never blocks, never does heavy work
+
+// RTUMasterTask "takes" it with a timeout (shown in 1.3 above) --
+// this is the standard, safe ISR-to-task wakeup pattern.
+
+// (b) Mutex: protects the shared gStats struct from concurrent
+// read/modify by RTUMasterTask and (optionally) a DiagnosticsTask.
+MutexLock(xStatsMutex)  ... modify/read gStats ...  MutexUnlock(xStatsMutex)
+1.5 Inter-task Communication
+xReqQueue  : TCPServerTask  --(ModbusRequest_t)-->  RTUMasterTask
+xRespQueue : RTUMasterTask  --(ModbusResponse_t)--> TCPServerTask
+
+// Queues both carry data AND provide synchronization:
+// QueueReceive(..., WAIT_FOREVER) blocks the calling task until data
+// exists, so no polling loop or extra "data ready" flag is needed.
+1.6 Main Application Flow
+POWER ON
+  -> HAL/Peripheral/RTOS-object init (1.1)
+  -> Create tasks (1.2), all initially BLOCKED on their queue/semaphore
+  -> Start scheduler
+      -> TCPServerTask blocks on TCP_Accept / xRespQueue
+      -> RTUMasterTask blocks on xReqQueue
+      -> WatchdogTask sleeps 1000 ms at a time
+  -> EVENT: TCP client sends a request
+      -> TCPServerTask wakes -> pushes to xReqQueue -> blocks on xRespQueue
+      -> RTUMasterTask wakes -> sends RTU frame -> blocks on semaphore
+      -> EVENT: UART RX ISR fires -> gives semaphore
+      -> RTUMasterTask wakes -> pushes result to xRespQueue -> blocks again
+      -> TCPServerTask wakes -> replies to client -> loops back
+  -> System runs forever, each task idle (0% CPU) except when its event occurs
+
+  2. Source Code (C, STM32 HAL + FreeRTOS + lwIP)
+
+modbus_gateway.h
+
+c
+#ifndef MODBUS_GATEWAY_H
+#define MODBUS_GATEWAY_H
+
+#include "main.h"
+#include "cmsis_os.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "semphr.h"
+#include <string.h>
+
+/* ---------------- Configuration ---------------- */
+#define MAX_PDU_LEN                 253
+#define RTU_TIMEOUT_MS               500
+#define MODBUS_TCP_PORT              502
+#define GATEWAY_TARGET_NO_RESPONSE   0x0B   /* standard Modbus exception */
+
+#define TCP_TASK_PRIORITY      (tskIDLE_PRIORITY + 3)
+#define RTU_TASK_PRIORITY       (tskIDLE_PRIORITY + 3)
+#define WATCHDOG_TASK_PRIORITY  (tskIDLE_PRIORITY + 1)
+
+#define TCP_TASK_STACK_WORDS      1024
+#define RTU_TASK_STACK_WORDS       512
+#define WATCHDOG_TASK_STACK_WORDS  256
+
+/* Board-specific handles/pins -- edit to match your CubeMX pinout */
+extern UART_HandleTypeDef huart2;      /* RS-485 UART            */
+#define RS485_DE_GPIO_Port   GPIOB
+#define RS485_DE_Pin         GPIO_PIN_5
+#define HEARTBEAT_LED_Port   GPIOB
+#define HEARTBEAT_LED_Pin    GPIO_PIN_0
+
+/* ---------------- Data structures ---------------- */
+typedef struct {
+    uint16_t transactionId;
+    uint8_t  unitId;
+    uint8_t  pdu[MAX_PDU_LEN];
+    uint16_t pduLen;
+} ModbusRequest_t;
+
+typedef struct {
+    uint16_t transactionId;
+    uint8_t  status;              /* 0 = OK, else Modbus exception code */
+    uint8_t  pdu[MAX_PDU_LEN];
+    uint16_t pduLen;
+} ModbusResponse_t;
+
+typedef struct {
+    uint32_t successCount;
+    uint32_t timeoutCount;
+    uint32_t crcErrorCount;
+} GatewayStats_t;
+
+/* ---------------- RTOS objects (defined in modbus_gateway.c) ---------------- */
+extern QueueHandle_t     xReqQueue;
+extern QueueHandle_t     xRespQueue;
+extern SemaphoreHandle_t xRtuRxSemaphore;
+extern SemaphoreHandle_t xStatsMutex;
+extern GatewayStats_t    gStats;
+
+/* ---------------- Public API ---------------- */
+void     ModbusGateway_Init(void);          /* call once, before vTaskStartScheduler() */
+uint16_t ModbusCRC16(const uint8_t *buf, uint16_t len);
+
+void TCPServerTask(void *argument);
+void RTUMasterTask(void *argument);
+void WatchdogTask(void *argument);
+
+#endif /* MODBUS_GATEWAY_H */
+
+modbus_gateway.c
+
+c
+#include "modbus_gateway.h"
+#include "lwip/api.h"
+
+/* ---------------- RTOS object definitions ---------------- */
+QueueHandle_t     xReqQueue;
+QueueHandle_t     xRespQueue;
+SemaphoreHandle_t xRtuRxSemaphore;
+SemaphoreHandle_t xStatsMutex;
+GatewayStats_t    gStats = {0};
+
+/* RTU receive buffer, filled by the UART driver, read by RTUMasterTask */
+static volatile uint8_t  rtuRxBuffer[256];
+static volatile uint16_t rtuRxLen;
+
+/* =======================================================
+ * RTOS Initialization + Task Creation
+ * (call this once from main(), BEFORE vTaskStartScheduler())
+ * ======================================================= */
+void ModbusGateway_Init(void)
+{
+    xReqQueue       = xQueueCreate(4, sizeof(ModbusRequest_t));
+    xRespQueue      = xQueueCreate(4, sizeof(ModbusResponse_t));
+    xRtuRxSemaphore = xSemaphoreCreateBinary();
+    xStatsMutex     = xSemaphoreCreateMutex();
+
+    configASSERT(xReqQueue != NULL);
+    configASSERT(xRespQueue != NULL);
+    configASSERT(xRtuRxSemaphore != NULL);
+    configASSERT(xStatsMutex != NULL);
+
+    xTaskCreate(TCPServerTask, "TCPServer", TCP_TASK_STACK_WORDS,
+                NULL, TCP_TASK_PRIORITY, NULL);
+
+    xTaskCreate(RTUMasterTask, "RTUMaster", RTU_TASK_STACK_WORDS,
+                NULL, RTU_TASK_PRIORITY, NULL);
+
+    xTaskCreate(WatchdogTask, "Watchdog", WATCHDOG_TASK_STACK_WORDS,
+                NULL, WATCHDOG_TASK_PRIORITY, NULL);
+}
+
+/* =======================================================
+ * CRC16 (Modbus) -- unit-test this against known vectors first
+ * ======================================================= */
+uint16_t ModbusCRC16(const uint8_t *buf, uint16_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (uint16_t pos = 0; pos < len; pos++) {
+        crc ^= (uint16_t)buf[pos];
+        for (uint8_t bit = 0; bit < 8; bit++) {
+            if (crc & 0x0001) {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc; /* send low byte first, then high byte */
+}
+
+/* =======================================================
+ * ISR: UART RX complete -- ISR-to-task handoff via semaphore.
+ * Must stay tiny: only "give" the semaphore, never block here.
+ * ======================================================= */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(xRtuRxSemaphore, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+/* =======================================================
+ * TASK: RTU Master -- the ONLY task allowed to touch the RS-485 UART
+ * ======================================================= */
+void RTUMasterTask(void *argument)
+{
+    ModbusRequest_t  req;
+    ModbusResponse_t resp;
+    uint8_t txFrame[MAX_PDU_LEN + 3]; /* unitId + pdu + 2 CRC bytes */
+
+    for (;;)
+    {
+        /* Blocks here with 0% CPU until the TCP task hands us work */
+        if (xQueueReceive(xReqQueue, &req, portMAX_DELAY) == pdTRUE)
+        {
+            /* 1. Build the RTU frame: unitId + pdu + CRC16 */
+            uint16_t frameLen = 0;
+            txFrame[frameLen++] = req.unitId;
+            memcpy(&txFrame[frameLen], req.pdu, req.pduLen);
+            frameLen += req.pduLen;
+
+            uint16_t crc = ModbusCRC16(txFrame, frameLen);
+            txFrame[frameLen++] = (uint8_t)(crc & 0xFF);
+            txFrame[frameLen++] = (uint8_t)((crc >> 8) & 0xFF);
+
+            /* 2. Transmit over RS-485: assert DE, send, release DE */
+            HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_SET);
+            HAL_UART_Transmit(&huart2, txFrame, frameLen, 100);
+            while (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_TC) == RESET) { }
+            HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_RESET);
+
+            /* 3. Arm receiver, wait for ISR-signalled reply (with timeout) */
+            rtuRxLen = 0;
+            HAL_UART_Receive_IT(&huart2, (uint8_t *)rtuRxBuffer, sizeof(rtuRxBuffer));
+
+            resp.transactionId = req.transactionId;
+
+            xSemaphoreTake(xStatsMutex, portMAX_DELAY);
+            if (xSemaphoreTake(xRtuRxSemaphore, pdMS_TO_TICKS(RTU_TIMEOUT_MS)) == pdTRUE)
+            {
+                uint16_t rxLen   = rtuRxLen;
+                uint16_t rxCrc   = ModbusCRC16((const uint8_t *)rtuRxBuffer, rxLen - 2);
+                uint16_t recvCrc = rtuRxBuffer[rxLen - 2] | (rtuRxBuffer[rxLen - 1] << 8);
+
+                if (rxCrc == recvCrc)
+                {
+                    resp.status = 0; /* OK */
+                    resp.pduLen = rxLen - 1 /*unitId*/ - 2 /*crc*/;
+                    memcpy(resp.pdu, (const void *)&rtuRxBuffer[1], resp.pduLen);
+                    gStats.successCount++;
+                }
+                else
+                {
+                    resp.status = GATEWAY_TARGET_NO_RESPONSE;
+                    resp.pduLen = 0;
+                    gStats.crcErrorCount++;
+                }
+            }
+            else
+            {
+                resp.status = GATEWAY_TARGET_NO_RESPONSE; /* timeout */
+                resp.pduLen = 0;
+                gStats.timeoutCount++;
+            }
+            xSemaphoreGive(xStatsMutex);
+
+            /* 4. Hand the result back to the waiting TCP task */
+            xQueueSend(xRespQueue, &resp, portMAX_DELAY);
+        }
+    }
+}
+
+/* =======================================================
+ * TASK: TCP Server -- accepts Modbus TCP clients on port 502
+ * ======================================================= */
+void TCPServerTask(void *argument)
+{
+    struct netconn *listenConn, *client;
+    struct netbuf  *inbuf;
+    uint8_t mbap[7];
+
+    listenConn = netconn_new(NETCONN_TCP);
+    netconn_bind(listenConn, NULL, MODBUS_TCP_PORT);
+    netconn_listen(listenConn);
+
+    for (;;)
+    {
+        if (netconn_accept(listenConn, &client) == ERR_OK)
+        {
+            for (;;)
+            {
+                if (netconn_recv(client, &inbuf) != ERR_OK) break;
+
+                uint8_t *data; uint16_t dataLen;
+                netbuf_data(inbuf, (void **)&data, &dataLen);
+                if (dataLen < 8) { netbuf_delete(inbuf); break; }
+
+                memcpy(mbap, data, 7);
+                uint16_t length = (mbap[4] << 8) | mbap[5];
+
+                ModbusRequest_t req = {0};
+                req.transactionId = (mbap[0] << 8) | mbap[1];
+                req.unitId        = mbap[6];
+                req.pduLen        = length - 1;
+                memcpy(req.pdu, &data[7], req.pduLen);
+                netbuf_delete(inbuf);
+
+                /* Hand off to RTU side, then block until the reply arrives */
+                xQueueSend(xReqQueue, &req, portMAX_DELAY);
+
+                ModbusResponse_t resp;
+                xQueueReceive(xRespQueue, &resp, portMAX_DELAY);
+
+                uint8_t  out[7 + MAX_PDU_LEN];
+                uint16_t outLen = resp.pduLen + 1; /* +1 for unit ID byte */
+                out[0] = mbap[0]; out[1] = mbap[1];  /* Transaction ID   */
+                out[2] = 0x00;    out[3] = 0x00;     /* Protocol ID = 0  */
+                out[4] = (outLen >> 8) & 0xFF;
+                out[5] = outLen & 0xFF;              /* Length           */
+                out[6] = mbap[6];                    /* Unit ID          */
+                memcpy(&out[7], resp.pdu, resp.pduLen);
+
+                netconn_write(client, out, 7 + resp.pduLen, NETCONN_COPY);
+            }
+            netconn_close(client);
+            netconn_delete(client);
+        }
+    }
+}
+
+/* =======================================================
+ * TASK: Watchdog + heartbeat -- lowest priority, must never
+ * delay real Modbus traffic
+ * ======================================================= */
+void WatchdogTask(void *argument)
+{
+    for (;;)
+    {
+        HAL_IWDG_Refresh(&hiwdg);   /* remove this line if IWDG not enabled */
+        HAL_GPIO_TogglePin(HEARTBEAT_LED_Port, HEARTBEAT_LED_Pin);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
