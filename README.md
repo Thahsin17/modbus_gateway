@@ -1,5 +1,7 @@
 # modbus_gateway
 1. Pseudocode
+
+   
 1.1 Initialization
 FUNCTION main():
     HAL_Init()
@@ -118,7 +120,17 @@ POWER ON
       -> TCPServerTask wakes -> replies to client -> loops back
   -> System runs forever, each task idle (0% CPU) except when its event occurs
 
-  2. Source Code (C, STM32 HAL + FreeRTOS + lwIP)
+
+
+
+
+
+2. Source Code (C, STM32 HAL + FreeRTOS + lwIP)
+
+
+
+
+   
 
 modbus_gateway.h
 
