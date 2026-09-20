@@ -1,0 +1,6 @@
+xReqQueue  : TCPServerTask  --(ModbusRequest_t)-->  RTUMasterTask
+xRespQueue : RTUMasterTask  --(ModbusResponse_t)--> TCPServerTask
+
+// Queues both carry data AND provide synchronization:
+// QueueReceive(..., WAIT_FOREVER) blocks the calling task until data
+// exists, so no polling loop or extra "data ready" flag is needed.
