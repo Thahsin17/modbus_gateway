@@ -1,0 +1,14 @@
+1.4 Synchronization
+// (a) ISR -> Task handoff: binary semaphore
+ISR UART_RxCompleteCallback():
+    higherPriorityTaskWoken = FALSE
+    SemaphoreGiveFromISR(xRtuRxSemaphore, &higherPriorityTaskWoken)
+    YieldFromISR(higherPriorityTaskWoken)
+    // ISR only "gives" -- never blocks, never does heavy work
+
+// RTUMasterTask "takes" it with a timeout (shown in 1.3 above) --
+// this is the standard, safe ISR-to-task wakeup pattern.
+
+// (b) Mutex: protects the shared gStats struct from concurrent
+// read/modify by RTUMasterTask and (optionally) a DiagnosticsTask.
+MutexLock(xStatsMutex)  ... modify/read gStats ...  MutexUnlock(xStatsMutex)
