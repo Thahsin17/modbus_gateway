@@ -1,0 +1,18 @@
+1.1 Initialization
+FUNCTION main():
+    HAL_Init()
+    SystemClock_Config()
+    MX_GPIO_Init()              // configures RS485_DE pin as output
+    MX_USART2_UART_Init()       // RS-485 UART (RTU side)
+    MX_LWIP_Init()              // Ethernet + TCP/IP stack (TCP side)
+    MX_IWDG_Init()              // independent watchdog (optional but recommended)
+
+    // RTOS objects must exist BEFORE the scheduler starts
+    xReqQueue        = QueueCreate(length = 4, itemSize = sizeof(ModbusRequest_t))
+    xRespQueue       = QueueCreate(length = 4, itemSize = sizeof(ModbusResponse_t))
+    xRtuRxSemaphore  = SemaphoreCreateBinary()
+    xStatsMutex      = MutexCreate()
+
+    CALL Task_Creation()
+    SchedulerStart()            // control never returns from here
+END FUNCTION
